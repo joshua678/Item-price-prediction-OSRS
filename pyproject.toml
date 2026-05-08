@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "item-price-prediction-osrs"
+version = "0.1.0"
+description = "Forecasting Old School RuneScape Grand Exchange item prices from historical price and volume data."
+readme = "README.md"
+requires-python = ">=3.12"
+license = { file = "LICENSE" }
+authors = [
+    { name = "Joshua" }
+]
+dependencies = [
+    "numpy==2.4.4",
+    "pandas==3.0.2",
+    "tqdm==4.67.3",
+    "scikit-learn==1.8.0",
+    "torch==2.11.0",
+    "matplotlib==3.10.9",
+    "requests==2.33.1",
+]
+
+[tool.setuptools.packages.find]
+include = ["osrs_pred*"]
+exclude = ["data*", "prediction_model*", "sample_data*", "benchmarking*"]

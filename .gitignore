@@ -1,0 +1,35 @@
+# Python environments and caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+
+# Local configuration
+.env
+.env.*
+!.env.example
+*.log
+collector_execution_log.txt
+
+# Full generated datasets and model artifacts
+/data/
+/prediction_model/cache/
+/prediction_model/*.pt
+/prediction_model/*.pth
+/prediction_model/*.pkl
+/prediction_model/*.pkl.gz
+/prediction_model/*.png
+
+# Generated plots and reports
+/benchmarking/plots/
+
+# OS/editor files
+.DS_Store
+Thumbs.db
