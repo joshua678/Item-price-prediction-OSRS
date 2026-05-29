@@ -1,6 +1,6 @@
 # Old School RuneScape Item Price Prediction
 
-I built this project to forecast short-term Old School RuneScape Grand Exchange item price movements from historical price and volume data. The model is a PyTorch LSTM quantile regressor that produces probabilistic forecasts for both high and low traded prices across multiple future horizons.
+I built this project to forecast short-term item price movements from historical price and volume data collected from the online multiplayer game Old School RuneScape. I chose this market because it has high item diversity, frequent trading activity, and publicly available time-series data. The model is a PyTorch LSTM quantile regressor that produces probabilistic forecasts for both high and low traded prices across multiple future horizons.
 
 My aim was to build a complete statistical data science workflow around a public, high-frequency market dataset: data collection, cleaning, feature engineering, leakage-aware train/validation/test splitting, probabilistic modelling, benchmark comparison, calibration analysis, and reproducible reporting.
 
@@ -55,21 +55,21 @@ The validation skill curve shows that most of the improvement arrives early and 
 
 ## Forecast examples
 
-Each example uses 24 hours of 5-minute data as model input and plots the next 6 hours using hourly aggregation. The blue dots are predicted medians, the orange band is the p25-p75 interval, and the blue band is the p10-p90 interval.
+Each example uses 24 hours of 5-minute data as model input and plots the next 3 hours using hourly aggregation. The blue dots are predicted medians, the orange band is the p25-p75 interval, and the blue band is the p10-p90 interval.
 
-### Representative case: Black chinchompa
+### Representative item: Black chinchompa
 
 ![Representative Black chinchompa forecast](docs/figures/forecast_representative_black_chinchompa.png)
 
 I treat this as a representative example: the realised future path stays within the central prediction intervals and the model produces a stable short-term forecast.
 
-### Volatile case: Black dragon leather
+### Volatile item: Black dragon leather
 
 ![Volatile Black dragon leather forecast](docs/figures/forecast_volatile_black_dragon_leather.png)
 
 This example shows the model reacting to a more volatile recent price path. The realised future decline is directionally captured, while the prediction interval is visibly wider.
 
-### Failure case: Dragon crossbow
+### Failure item: Dragon crossbow
 
 ![Failure Dragon crossbow forecast](docs/figures/forecast_failure_dragon_crossbow.png)
 
@@ -272,7 +272,7 @@ A score above zero indicates improvement over the unconditional quantile baselin
 
 ## Setup
 
-I developed this project with Python 3.12 or newer.
+I developed this project with Python 3.12.
 
 Create and activate a virtual environment:
 
