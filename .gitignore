@@ -26,6 +26,7 @@ collector_execution_log.txt
 /prediction_model/*.pkl
 /prediction_model/*.pkl.gz
 /prediction_model/*.png
+/prediction_model/*.json
 
 # Generated plots and reports
 /benchmarking/plots/

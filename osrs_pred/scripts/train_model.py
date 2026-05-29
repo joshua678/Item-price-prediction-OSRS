@@ -42,6 +42,7 @@ def main() -> None:
         f"seq_len={cfg.seq_len_hours}h ({cfg.seq_len_steps} steps) | "
         f"stride={cfg.stride_steps} steps ({cfg.stride_steps * cfg.step_minutes}m) | "
         f"eval_stride={eval_stride_steps} step ({eval_stride_steps * cfg.step_minutes}m) | "
+        f"validations_per_epoch={cfg.validations_per_epoch} | "
         f"layers={cfg.num_layers}"
     )
 
@@ -143,6 +144,7 @@ def main() -> None:
         trained_items=trained_items,
         seed=cfg.seed,
         eval_stride=eval_stride_steps,
+        validations_per_epoch=cfg.validations_per_epoch,
         metadata={
             "base_freq": cfg.base_freq,
             "step_minutes": cfg.step_minutes,
@@ -155,6 +157,7 @@ def main() -> None:
             "max_horizon_steps": cfg.max_horizon_steps,
             "n_horizons": cfg.n_horizons,
             "num_layers": cfg.num_layers,
+            "validations_per_epoch": cfg.validations_per_epoch,
         },
     )
 

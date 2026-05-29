@@ -29,3 +29,24 @@ python -m benchmarking.plot_test_forecasts --output-dir benchmarking/plots/lates
 Hourly mode keeps model inference on the same 5-minute input windows, but renders actual prices in hourly buckets. Forecast intervals are drawn at model horizons that land on whole hours, such as 1h, 2h, 3h, and 6h for the default horizon list.
 
 The checkpoint must have been trained with the current multi-horizon config. Older single-horizon checkpoints will fail fast with a horizon-count mismatch.
+
+## Training log plots
+
+Generate README-ready training curves from `prediction_model/training_log.json`:
+
+```bash
+python -m benchmarking.plot_training_log
+```
+
+Default behavior:
+
+- Uses `prediction_model/training_log.json`.
+- Uses mid-epoch validation checkpoints when available, otherwise falls back to epoch summaries.
+- Writes plots plus a `manifest.csv` under `benchmarking/plots/training_log`.
+
+Useful options:
+
+```bash
+python -m benchmarking.plot_training_log --output-dir benchmarking/plots/readme
+python -m benchmarking.plot_training_log --log-path prediction_model/training_log.json
+```

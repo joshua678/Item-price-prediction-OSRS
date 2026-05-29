@@ -2,8 +2,10 @@ from __future__ import annotations
 
 from contextlib import nullcontext
 from collections import defaultdict
+import json
 import os
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Dict, List
 from time import perf_counter
 
@@ -16,12 +18,14 @@ from tqdm import tqdm
 
 from .baselines import unconditional_quantile_baseline
 from .dataloading import make_data_loader, move_batch_to_device, transfer_kwargs
+from ..config import DEFAULT_VALIDATIONS_PER_EPOCH
 from ..data.dataset import PriceSequenceDataset
 from ..models.lstm import LSTMQuantileRegressor
 from .metrics import eval_quantiles
 
 
 EPOCH_PROGRESS_UPDATE_EVERY = 25
+TRAINING_LOG_NAME = "training_log.json"
 
 
 def _epoch_progress_enabled() -> bool:
@@ -31,6 +35,14 @@ def _epoch_progress_enabled() -> bool:
 
 def _should_update_epoch_progress(batch_idx: int, total_batches: int) -> bool:
     return batch_idx % EPOCH_PROGRESS_UPDATE_EVERY == 0 or batch_idx == total_batches
+
+
+def _validation_checkpoints(total_batches: int, validations_per_epoch: int) -> set[int]:
+    if validations_per_epoch <= 0:
+        return {total_batches}
+    fractions = np.arange(1, validations_per_epoch + 1) / validations_per_epoch
+    raw = fractions * total_batches
+    return {int(np.ceil(v)) for v in raw}
 
 
 def _progress_loader(dl: DataLoader, desc: str, enabled: bool):
@@ -45,6 +57,154 @@ def _progress_loader(dl: DataLoader, desc: str, enabled: bool):
         dynamic_ncols=True,
         miniters=EPOCH_PROGRESS_UPDATE_EVERY,
     )
+
+
+def _json_safe(value):
+    if isinstance(value, np.ndarray):
+        return [_json_safe(v) for v in value.tolist()]
+    if isinstance(value, np.generic):
+        return _json_safe(value.item())
+    if isinstance(value, float) and not np.isfinite(value):
+        return None
+    if isinstance(value, torch.device):
+        return str(value)
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    return value
+
+
+def _atomic_write_json(payload: dict, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with tmp.open("w", encoding="utf-8") as fh:
+        json.dump(_json_safe(payload), fh, indent=2, allow_nan=False)
+        fh.write("\n")
+    os.replace(tmp, path)
+
+
+def _baseline_to_dict(name: str, baseline) -> dict:
+    return {
+        "name": name,
+        "quantiles": baseline.quantiles,
+        "q_values": baseline.q_values,
+        "pinball": baseline.pinball,
+        "coverage": baseline.coverage,
+        "mean_abs_coverage_error": baseline.cov_err_mean,
+        "width_10_90": baseline.width_10_90,
+    }
+
+
+def _pinball_by_horizon_np(
+    q_pred: np.ndarray,
+    y_true: np.ndarray,
+    quantiles: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    q_pred = np.asarray(q_pred, dtype=float)
+    y_true = np.asarray(y_true, dtype=float)
+    if q_pred.ndim == 2:
+        q_pred = q_pred[:, None, :]
+    if y_true.ndim == 1:
+        y_true = y_true[:, None]
+
+    n_horizons = y_true.shape[1]
+    losses = np.full(n_horizons, np.nan, dtype=float)
+    counts = np.zeros(n_horizons, dtype=np.int64)
+    q = np.asarray(quantiles, dtype=float).reshape(1, -1)
+
+    for h_idx in range(n_horizons):
+        mask = np.isfinite(y_true[:, h_idx]) & np.all(np.isfinite(q_pred[:, h_idx, :]), axis=1)
+        counts[h_idx] = int(mask.sum())
+        if counts[h_idx] == 0:
+            continue
+        yv = y_true[mask, h_idx][:, None]
+        qv = q_pred[mask, h_idx, :]
+        e = yv - qv
+        loss_q = np.maximum(q * e, (q - 1.0) * e)
+        losses[h_idx] = float(loss_q.mean(axis=1).mean())
+
+    return losses, counts
+
+
+def _baseline_pinball_by_horizon(
+    y_true: np.ndarray,
+    quantiles: tuple[float, ...],
+) -> tuple[np.ndarray, np.ndarray]:
+    y = np.asarray(y_true, dtype=float)
+    if y.ndim == 1:
+        y = y[:, None]
+
+    losses = np.full(y.shape[1], np.nan, dtype=float)
+    counts = np.zeros(y.shape[1], dtype=np.int64)
+    for h_idx in range(y.shape[1]):
+        values = y[:, h_idx]
+        counts[h_idx] = int(np.isfinite(values).sum())
+        if counts[h_idx] == 0:
+            continue
+        losses[h_idx] = unconditional_quantile_baseline(values, quantiles=quantiles).pinball
+    return losses, counts
+
+
+def _weighted_mean_by_horizon(
+    high_values: np.ndarray,
+    high_counts: np.ndarray,
+    low_values: np.ndarray,
+    low_counts: np.ndarray,
+) -> np.ndarray:
+    high_values = np.asarray(high_values, dtype=float)
+    low_values = np.asarray(low_values, dtype=float)
+    high_counts = np.asarray(high_counts, dtype=float)
+    low_counts = np.asarray(low_counts, dtype=float)
+    total_counts = high_counts + low_counts
+    numerator = np.nan_to_num(high_values, nan=0.0) * high_counts + np.nan_to_num(low_values, nan=0.0) * low_counts
+    out = np.full_like(numerator, np.nan, dtype=float)
+    valid = total_counts > 0
+    out[valid] = numerator[valid] / total_counts[valid]
+    return out
+
+
+def _skill_by_horizon(model_pinball: np.ndarray, baseline_pinball: np.ndarray) -> np.ndarray:
+    model_pinball = np.asarray(model_pinball, dtype=float)
+    baseline_pinball = np.asarray(baseline_pinball, dtype=float)
+    out = np.full_like(model_pinball, np.nan, dtype=float)
+    valid = np.isfinite(model_pinball) & np.isfinite(baseline_pinball) & (baseline_pinball > 0)
+    out[valid] = 1.0 - model_pinball[valid] / baseline_pinball[valid]
+    return out
+
+
+def _horizon_log_fields(
+    val_by_horizon: dict[str, np.ndarray],
+    *,
+    baseH_pinball_by_horizon: np.ndarray,
+    baseL_pinball_by_horizon: np.ndarray,
+    baseline_pinball_by_horizon: np.ndarray,
+) -> dict[str, np.ndarray]:
+    return {
+        "val_high_pinball_by_horizon": val_by_horizon["high_pinball"],
+        "val_low_pinball_by_horizon": val_by_horizon["low_pinball"],
+        "val_pinball_by_horizon": val_by_horizon["pinball"],
+        "val_high_count_by_horizon": val_by_horizon["high_count"],
+        "val_low_count_by_horizon": val_by_horizon["low_count"],
+        "val_count_by_horizon": val_by_horizon["count"],
+        "val_high_baseline_pinball_by_horizon": baseH_pinball_by_horizon,
+        "val_low_baseline_pinball_by_horizon": baseL_pinball_by_horizon,
+        "val_baseline_pinball_by_horizon": baseline_pinball_by_horizon,
+        "val_high_skill_vs_unconditional_by_horizon": _skill_by_horizon(
+            val_by_horizon["high_pinball"],
+            baseH_pinball_by_horizon,
+        ),
+        "val_low_skill_vs_unconditional_by_horizon": _skill_by_horizon(
+            val_by_horizon["low_pinball"],
+            baseL_pinball_by_horizon,
+        ),
+        "val_skill_vs_unconditional_by_horizon": _skill_by_horizon(
+            val_by_horizon["pinball"],
+            baseline_pinball_by_horizon,
+        ),
+    }
 
 
 def seed_everything(seed: int) -> None:
@@ -150,6 +310,63 @@ def predict_on_loader(
     )
 
 
+@torch.no_grad()
+def run_full_validation(
+    model: nn.Module,
+    dl_val: DataLoader,
+    device: torch.device,
+    q_tensor: torch.Tensor,
+    quantiles_np: np.ndarray,
+    *,
+    progress_desc: str,
+    show_progress: bool,
+) -> tuple[float, object, object, dict[str, np.ndarray]]:
+    model.eval()
+    v_sum_loss = 0.0
+    v_sum_count = 0.0
+    val_batches = len(dl_val)
+
+    with _progress_loader(dl_val, f"{progress_desc} loss", show_progress) as val_iter:
+        for batch_idx, batch in enumerate(val_iter, start=1):
+            X, yH, yL, item_id = move_batch_to_device(batch, device)
+
+            qH_pred, qL_pred = model(X, item_id)
+            lH, cH = pinball_loss_sum(qH_pred, yH, q_tensor)
+            lL, cL = pinball_loss_sum(qL_pred, yL, q_tensor)
+            v_sum_loss += float(lH.detach().cpu()) + float(lL.detach().cpu())
+            v_sum_count += float(cH.detach().cpu()) + float(cL.detach().cpu())
+
+            if hasattr(val_iter, "set_postfix") and _should_update_epoch_progress(batch_idx, val_batches):
+                val_iter.set_postfix(pinball=f"{v_sum_loss / max(v_sum_count, 1.0):.5f}")
+
+    val_loss = v_sum_loss / max(v_sum_count, 1.0)
+    yH_true, qH_all, yL_true, qL_all = predict_on_loader(
+        model,
+        dl_val,
+        device=device,
+        progress_desc=f"{progress_desc} calibrate",
+        show_progress=show_progress,
+    )
+    qeH = eval_quantiles(yH_true, qH_all, quantiles_np)
+    qeL = eval_quantiles(yL_true, qL_all, quantiles_np)
+    high_pinball_by_horizon, high_counts_by_horizon = _pinball_by_horizon_np(qH_all, yH_true, quantiles_np)
+    low_pinball_by_horizon, low_counts_by_horizon = _pinball_by_horizon_np(qL_all, yL_true, quantiles_np)
+    val_by_horizon = {
+        "high_pinball": high_pinball_by_horizon,
+        "low_pinball": low_pinball_by_horizon,
+        "pinball": _weighted_mean_by_horizon(
+            high_pinball_by_horizon,
+            high_counts_by_horizon,
+            low_pinball_by_horizon,
+            low_counts_by_horizon,
+        ),
+        "high_count": high_counts_by_horizon,
+        "low_count": low_counts_by_horizon,
+        "count": high_counts_by_horizon + low_counts_by_horizon,
+    }
+    return val_loss, qeH, qeL, val_by_horizon
+
+
 def train_model(
     *,
     train_arrays: List[np.ndarray],
@@ -182,9 +399,12 @@ def train_model(
     trained_items: List[str],
     seed: int,
     eval_stride: int = 1,
+    validations_per_epoch: int = DEFAULT_VALIDATIONS_PER_EPOCH,
     metadata: dict | None = None,
 ) -> tuple[LSTMQuantileRegressor, Dict[str, List[float]], StandardScaler]:
     seed_everything(seed)
+    if validations_per_epoch < 0:
+        raise ValueError(f"validations_per_epoch must be >= 0. Got {validations_per_epoch}.")
     output_dir.mkdir(parents=True, exist_ok=True)
 
     ensure_float32_in_place(train_arrays)
@@ -250,6 +470,14 @@ def train_model(
 
     baseH = unconditional_quantile_baseline(yH_val_all, quantiles=quantiles)
     baseL = unconditional_quantile_baseline(yL_val_all, quantiles=quantiles)
+    baseH_pinball_by_horizon, baseH_counts_by_horizon = _baseline_pinball_by_horizon(yH_val_all, quantiles)
+    baseL_pinball_by_horizon, baseL_counts_by_horizon = _baseline_pinball_by_horizon(yL_val_all, quantiles)
+    baseline_pinball_by_horizon = _weighted_mean_by_horizon(
+        baseH_pinball_by_horizon,
+        baseH_counts_by_horizon,
+        baseL_pinball_by_horizon,
+        baseL_counts_by_horizon,
+    )
 
     print(
         "Unconditional baseline (val-fit) | "
@@ -258,9 +486,86 @@ def train_model(
         f"width(0.1-0.9) H {baseH.width_10_90:.4f} L {baseL.width_10_90:.4f}"
     )
 
+    baseline_pinball_mean = (baseH.pinball + baseL.pinball) / 2
+    horizon_labels = [
+        f"{h} step{'s' if h != 1 else ''}"
+        for h in range(1, n_horizons + 1)
+    ]
+    if metadata and len(metadata.get("pred_horizons_steps", [])) == n_horizons:
+        horizon_labels = [
+            f"{h} step{'s' if h != 1 else ''}"
+            for h in metadata["pred_horizons_steps"]
+        ]
+    training_log_path = output_dir / TRAINING_LOG_NAME
+    training_log = {
+        "schema_version": 1,
+        "status": "running",
+        "description": "Per-epoch training metrics for OSRS price quantile forecasting.",
+        "metadata": metadata or {},
+        "data": {
+            "n_items": n_items,
+            "n_features": len(feat_cols),
+            "n_horizons": n_horizons,
+            "n_quantiles": Q,
+            "train_sequences": len(ds_train),
+            "val_sequences": len(ds_val),
+            "test_sequences": test_sequences,
+            "train_batches": len(dl_train),
+            "val_batches": len(dl_val),
+            "trained_items": trained_items,
+            "feature_columns": feat_cols,
+        },
+        "hyperparameters": {
+            "seq_len": seq_len,
+            "stride": stride,
+            "eval_stride": eval_stride,
+            "batch_size": batch_size,
+            "lr": lr,
+            "epochs": epochs,
+            "validations_per_epoch": validations_per_epoch,
+            "id_emb_dim": id_emb_dim,
+            "hidden_size": hidden_size,
+            "num_layers": num_layers,
+            "dropout": dropout,
+            "seed": seed,
+            "device": device,
+            "weight_decay": 1e-3,
+            "gradient_clip_norm": 1.0,
+        },
+        "quantiles": list(quantiles),
+        "baselines": {
+            "validation_unconditional_high": _baseline_to_dict("validation_unconditional_high", baseH),
+            "validation_unconditional_low": _baseline_to_dict("validation_unconditional_low", baseL),
+            "validation_unconditional_mean_pinball": baseline_pinball_mean,
+            "validation_unconditional_high_pinball_by_horizon": baseH_pinball_by_horizon,
+            "validation_unconditional_low_pinball_by_horizon": baseL_pinball_by_horizon,
+            "validation_unconditional_pinball_by_horizon": baseline_pinball_by_horizon,
+            "horizon_labels": horizon_labels,
+        },
+        "epochs": [],
+    }
+    _atomic_write_json(training_log, training_log_path)
+    print(f"Training metrics JSON will be updated at: {training_log_path}")
+
     show_epoch_progress = _epoch_progress_enabled()
     train_batches = len(dl_train)
-    val_batches = len(dl_val)
+    checkpoint_batches = _validation_checkpoints(train_batches, validations_per_epoch)
+    expected_val_checkpoints = len(checkpoint_batches) * epochs
+    quantiles_np = np.array(quantiles, dtype=float)
+    print(
+        "Full validation checkpoints: "
+        f"{len(checkpoint_batches)} per epoch, {expected_val_checkpoints} total "
+        f"(set OSRS_VALIDATIONS_PER_EPOCH=0 for end-of-epoch only)."
+    )
+    training_log["validation_cadence"] = {
+        "validations_per_epoch_requested": validations_per_epoch,
+        "checkpoint_batches": sorted(checkpoint_batches),
+        "checkpoints_per_epoch": len(checkpoint_batches),
+        "expected_total_checkpoints": expected_val_checkpoints,
+        "includes_end_of_epoch": train_batches in checkpoint_batches,
+    }
+    training_log["validation_checkpoints"] = []
+    _atomic_write_json(training_log, training_log_path)
 
     for epoch in range(1, epochs + 1):
         if device.type == "cuda":
@@ -270,6 +575,7 @@ def train_model(
         model.train()
         sum_loss = 0.0
         sum_count = 0.0
+        last_checkpoint = None
 
         with _progress_loader(
             dl_train,
@@ -298,43 +604,110 @@ def train_model(
                 if hasattr(train_iter, "set_postfix") and _should_update_epoch_progress(batch_idx, train_batches):
                     train_iter.set_postfix(pinball=f"{sum_loss / max(sum_count, 1.0):.5f}")
 
+                if batch_idx in checkpoint_batches:
+                    train_running = sum_loss / max(sum_count, 1.0)
+                    if device.type == "cuda":
+                        torch.cuda.synchronize()
+                    checkpoint_start = perf_counter()
+                    val_loss, qeH, qeL, val_by_horizon = run_full_validation(
+                        model,
+                        dl_val,
+                        device,
+                        q_tensor,
+                        quantiles_np,
+                        progress_desc=f"Epoch {epoch:02d}/{epochs:02d} val {batch_idx}/{train_batches}",
+                        show_progress=show_epoch_progress,
+                    )
+                    if device.type == "cuda":
+                        torch.cuda.synchronize()
+                    checkpoint_seconds = perf_counter() - checkpoint_start
+                    skill = 1 - val_loss / baseline_pinball_mean if baseline_pinball_mean > 0 else float("nan")
+                    current_lr = optimiser.param_groups[0]["lr"]
+                    horizon_fields = _horizon_log_fields(
+                        val_by_horizon,
+                        baseH_pinball_by_horizon=baseH_pinball_by_horizon,
+                        baseL_pinball_by_horizon=baseL_pinball_by_horizon,
+                        baseline_pinball_by_horizon=baseline_pinball_by_horizon,
+                    )
+                    checkpoint = {
+                        "epoch": epoch,
+                        "batch": batch_idx,
+                        "train_batches": train_batches,
+                        "epoch_fraction": batch_idx / train_batches,
+                        "global_checkpoint": len(training_log["validation_checkpoints"]) + 1,
+                        "train_pinball_running": train_running,
+                        "val_pinball": val_loss,
+                        "val_baseline_mean_pinball": baseline_pinball_mean,
+                        "val_skill_vs_unconditional": skill,
+                        "val_high_mean_abs_coverage_error": qeH.mean_abs_cov_err,
+                        "val_low_mean_abs_coverage_error": qeL.mean_abs_cov_err,
+                        "val_high_median_abs_coverage_error": qeH.median_abs_cov_err,
+                        "val_low_median_abs_coverage_error": qeL.median_abs_cov_err,
+                        "val_high_width_10_90": qeH.mean_width_10_90,
+                        "val_low_width_10_90": qeL.mean_width_10_90,
+                        "val_high_coverage": qeH.coverage,
+                        "val_low_coverage": qeL.coverage,
+                        **horizon_fields,
+                        "lr": current_lr,
+                        "seconds_since_epoch_start": perf_counter() - t_epoch0,
+                        "validation_seconds": checkpoint_seconds,
+                    }
+                    training_log["validation_checkpoints"].append(checkpoint)
+                    last_checkpoint = checkpoint
+                    _atomic_write_json(training_log, training_log_path)
+                    model.train()
+
         train_loss = sum_loss / max(sum_count, 1.0)
 
-        model.eval()
-        v_sum_loss = 0.0
-        v_sum_count = 0.0
-
-        with torch.no_grad():
-            with _progress_loader(
+        if last_checkpoint is None:
+            val_loss, qeH, qeL, val_by_horizon = run_full_validation(
+                model,
                 dl_val,
-                f"Epoch {epoch:02d}/{epochs:02d} val",
-                show_epoch_progress,
-            ) as val_iter:
-                for batch_idx, batch in enumerate(val_iter, start=1):
-                    X, yH, yL, item_id = move_batch_to_device(batch, device)
-
-                    qH_pred, qL_pred = model(X, item_id)
-                    lH, cH = pinball_loss_sum(qH_pred, yH, q_tensor)
-                    lL, cL = pinball_loss_sum(qL_pred, yL, q_tensor)
-                    v_sum_loss += float(lH.detach().cpu()) + float(lL.detach().cpu())
-                    v_sum_count += float(cH.detach().cpu()) + float(cL.detach().cpu())
-
-                    if hasattr(val_iter, "set_postfix") and _should_update_epoch_progress(batch_idx, val_batches):
-                        val_iter.set_postfix(pinball=f"{v_sum_loss / max(v_sum_count, 1.0):.5f}")
-
-        val_loss = v_sum_loss / max(v_sum_count, 1.0)
-
-        yH_true, qH_all, yL_true, qL_all = predict_on_loader(
-            model,
-            dl_val,
-            device=device,
-            progress_desc=f"Epoch {epoch:02d}/{epochs:02d} calibrate",
-            show_progress=show_epoch_progress,
-        )
-        qeH = eval_quantiles(yH_true, qH_all, np.array(quantiles, dtype=float))
-        qeL = eval_quantiles(yL_true, qL_all, np.array(quantiles, dtype=float))
-
-        skill = 1 - val_loss / ((baseH.pinball + baseL.pinball) / 2)
+                device,
+                q_tensor,
+                quantiles_np,
+                progress_desc=f"Epoch {epoch:02d}/{epochs:02d} val",
+                show_progress=show_epoch_progress,
+            )
+            skill = 1 - val_loss / baseline_pinball_mean if baseline_pinball_mean > 0 else float("nan")
+            horizon_fields = _horizon_log_fields(
+                val_by_horizon,
+                baseH_pinball_by_horizon=baseH_pinball_by_horizon,
+                baseL_pinball_by_horizon=baseL_pinball_by_horizon,
+                baseline_pinball_by_horizon=baseline_pinball_by_horizon,
+            )
+        else:
+            val_loss = float(last_checkpoint["val_pinball"])
+            skill = float(last_checkpoint["val_skill_vs_unconditional"])
+            horizon_fields = {
+                key: last_checkpoint[key]
+                for key in (
+                    "val_high_pinball_by_horizon",
+                    "val_low_pinball_by_horizon",
+                    "val_pinball_by_horizon",
+                    "val_high_count_by_horizon",
+                    "val_low_count_by_horizon",
+                    "val_count_by_horizon",
+                    "val_high_baseline_pinball_by_horizon",
+                    "val_low_baseline_pinball_by_horizon",
+                    "val_baseline_pinball_by_horizon",
+                    "val_high_skill_vs_unconditional_by_horizon",
+                    "val_low_skill_vs_unconditional_by_horizon",
+                    "val_skill_vs_unconditional_by_horizon",
+                )
+            }
+            qeH = SimpleNamespace(
+                mean_abs_cov_err=last_checkpoint["val_high_mean_abs_coverage_error"],
+                median_abs_cov_err=last_checkpoint["val_high_median_abs_coverage_error"],
+                mean_width_10_90=last_checkpoint["val_high_width_10_90"],
+                coverage=last_checkpoint["val_high_coverage"],
+            )
+            qeL = SimpleNamespace(
+                mean_abs_cov_err=last_checkpoint["val_low_mean_abs_coverage_error"],
+                median_abs_cov_err=last_checkpoint["val_low_median_abs_coverage_error"],
+                mean_width_10_90=last_checkpoint["val_low_width_10_90"],
+                coverage=last_checkpoint["val_low_coverage"],
+            )
 
         history["train_loss"].append(train_loss)
         history["val_loss"].append(val_loss)
@@ -342,12 +715,41 @@ def train_model(
         history["val_cov_err_mean_L"].append(qeL.mean_abs_cov_err)
         history["val_width_10_90_H"].append(qeH.mean_width_10_90)
         history["val_width_10_90_L"].append(qeL.mean_width_10_90)
+        history["val_skill_vs_unconditional"].append(skill)
+        history["val_skill_vs_unconditional_by_horizon"].append(
+            horizon_fields["val_skill_vs_unconditional_by_horizon"]
+        )
 
         current_lr = optimiser.param_groups[0]["lr"]
 
         if device.type == "cuda":
             torch.cuda.synchronize()
         epoch_s = perf_counter() - t_epoch0
+        history["lr"].append(current_lr)
+        history["epoch_seconds"].append(epoch_s)
+
+        training_log["epochs"].append(
+            {
+                "epoch": epoch,
+                "train_pinball": train_loss,
+                "val_pinball": val_loss,
+                "val_baseline_mean_pinball": baseline_pinball_mean,
+                "val_skill_vs_unconditional": skill,
+                "val_high_mean_abs_coverage_error": qeH.mean_abs_cov_err,
+                "val_low_mean_abs_coverage_error": qeL.mean_abs_cov_err,
+                "val_high_median_abs_coverage_error": qeH.median_abs_cov_err,
+                "val_low_median_abs_coverage_error": qeL.median_abs_cov_err,
+                "val_high_width_10_90": qeH.mean_width_10_90,
+                "val_low_width_10_90": qeL.mean_width_10_90,
+                "val_high_coverage": qeH.coverage,
+                "val_low_coverage": qeL.coverage,
+                **horizon_fields,
+                "lr": current_lr,
+                "epoch_seconds": epoch_s,
+                "best_val_pinball_so_far": min(best_val_loss, val_loss),
+            }
+        )
+        _atomic_write_json(training_log, training_log_path)
 
         print(
             f"Epoch {epoch:02d} "
@@ -386,6 +788,10 @@ def train_model(
         if metadata:
             payload.update(metadata)
         pickle.dump(payload, fh)
+
+    training_log["status"] = "completed"
+    training_log["best_val_pinball"] = best_val_loss
+    _atomic_write_json(training_log, training_log_path)
     print(f"\nAll artefacts saved to {output_dir}")
 
     return model, history, scaler

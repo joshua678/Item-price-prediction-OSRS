@@ -253,6 +253,20 @@ def _plot_one(
     x_input = np.arange(-input_steps, 1)
     x_output = np.arange(0, output_steps + 1)
     h_x = np.asarray(horizons, dtype=int)
+    horizon_mask = h_x <= output_steps
+    if not np.any(horizon_mask):
+        raise ValueError(f"No model horizons are <= output_steps={output_steps}. Horizons: {horizons}")
+    h_x = h_x[horizon_mask]
+    pred_p10_high = pred_p10_high[horizon_mask]
+    pred_p25_high = pred_p25_high[horizon_mask]
+    pred_p50_high = pred_p50_high[horizon_mask]
+    pred_p75_high = pred_p75_high[horizon_mask]
+    pred_p90_high = pred_p90_high[horizon_mask]
+    pred_p10_low = pred_p10_low[horizon_mask]
+    pred_p25_low = pred_p25_low[horizon_mask]
+    pred_p50_low = pred_p50_low[horizon_mask]
+    pred_p75_low = pred_p75_low[horizon_mask]
+    pred_p90_low = pred_p90_low[horizon_mask]
 
     high_input = df_feat["avgHighPrice"].iloc[anchor_pos - input_steps:anchor_pos + 1].to_numpy(dtype=float)
     low_input = df_feat["avgLowPrice"].iloc[anchor_pos - input_steps:anchor_pos + 1].to_numpy(dtype=float)
@@ -443,9 +457,10 @@ def main() -> None:
     model_dir = args.model_dir or cfg.output_dir
     bundle = _load_model_bundle(model_dir, cfg, device)
 
-    required_future_steps = max(args.output_steps, max(bundle.horizons))
+    required_future_steps = args.output_steps
     split_margin = pd.Timedelta(minutes=required_future_steps * cfg.step_minutes)
     selected_items = _parse_items(args.items)
+    plotted_horizons = tuple(h for h in bundle.horizons if h <= args.output_steps)
 
     item_dfs = load_and_filter(
         input_dir=cfg.input_dir,
@@ -494,7 +509,7 @@ def main() -> None:
 
             out_path = (
                 args.output_dir
-                / f"{_safe_name(item_name)}__{anchor_dt:%Y%m%d_%H%M%S}__{args.plot_frequency}__{plot_idx:02d}.png"
+                / f"{item_idx:03d}_{_safe_name(item_name)}__{anchor_dt:%Y%m%d_%H%M%S}__{args.plot_frequency}__{plot_idx:02d}.png"
             )
             _plot_one(
                 out_path=out_path,
@@ -521,7 +536,7 @@ def main() -> None:
                     "output_steps": str(args.output_steps),
                     "plot_frequency": args.plot_frequency,
                     "hourly_aggregation": args.hourly_aggregation,
-                    "horizons": ",".join(str(h) for h in bundle.horizons),
+                    "horizons": ",".join(str(h) for h in plotted_horizons),
                     "plot_path": str(out_path),
                 }
             )

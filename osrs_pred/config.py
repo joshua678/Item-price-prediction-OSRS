@@ -56,6 +56,7 @@ def _parse_positive_ints(s: str, *, name: str) -> tuple[int, ...]:
 
 
 DEFAULT_PRED_HORIZONS_STEPS = (1, 2, 3, 6, 12, 24, 36, 72)
+DEFAULT_VALIDATIONS_PER_EPOCH = 16
 
 
 @dataclass(frozen=True)
@@ -83,6 +84,7 @@ class Config:
     # Training
     lr: float
     epochs: int
+    validations_per_epoch: int
 
     # Quantile regression
     quantiles: tuple[float, ...]
@@ -161,6 +163,12 @@ class Config:
 
         lr = float(os.getenv("LR", "5e-5"))
         epochs = int(os.getenv("EPOCHS", "3"))
+        validations_per_epoch = int(os.getenv("OSRS_VALIDATIONS_PER_EPOCH", str(DEFAULT_VALIDATIONS_PER_EPOCH)))
+        if validations_per_epoch < 0:
+            raise ValueError(
+                "OSRS_VALIDATIONS_PER_EPOCH must be >= 0. "
+                f"Got: {validations_per_epoch}"
+            )
 
         quantiles = _parse_quantiles(os.getenv("QUANTILES", "0.05,0.1,0.25,0.5,0.75,0.9,0.95"))
 
@@ -190,6 +198,7 @@ class Config:
             batch_size=batch_size,
             lr=lr,
             epochs=epochs,
+            validations_per_epoch=validations_per_epoch,
             quantiles=quantiles,
             min_cover=min_cover,
             id_emb_dim=id_emb_dim,
